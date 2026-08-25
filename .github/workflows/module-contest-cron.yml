@@ -1,0 +1,42 @@
+name: Module Contest & Cheating Pipeline
+
+on:
+  schedule:
+    # Runs daily at 03:00 UTC. Adjust to whenever makes sense for your data
+    # freshness needs — cron syntax is: minute hour day-of-month month day-of-week
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+concurrency:
+  # Prevents two runs from overlapping (e.g. a manual run firing while the
+  # scheduled one is still going) — important since a single run can
+  # legitimately take 30-60+ minutes given how slow some Metabase cards are.
+  group: module-contest-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    # Generous ceiling: up to 11 unique card fetches per run (after caching),
+    # several of which routinely take 3-5 minutes each, plus retry/backoff
+    # time if anything is flaky. 90 minutes gives real headroom without
+    # letting a truly hung job run forever.
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+        run: python pipeline.py
