@@ -1,0 +1,6 @@
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+gspread>=6.0.0
+gspread-dataframe>=3.3.0
+google-auth>=2.25.0
