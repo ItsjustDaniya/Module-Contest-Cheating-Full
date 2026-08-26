@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs daily at 03:00 UTC. Adjust to whenever makes sense for your data
     # freshness needs — cron syntax is: minute hour day-of-month month day-of-week
-    - cron: "0 3 * * *"
+    - cron: "0 */4 * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 concurrency:
