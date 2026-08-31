@@ -2,7 +2,6 @@
 """
 Module Contest / Mid Module Clearance / Cheating Pipeline
 Unattended GitHub Actions cron version.
-
 Ported from Module_contest_fixed.ipynb (Colab notebook) into a standalone
 script for scheduled execution. Writes 6 tabs into one Google Sheet:
   - Module Clearance          (Module Contest, scored + gem/non-gem split)
@@ -11,7 +10,6 @@ script for scheduled execution. Writes 6 tabs into one Google Sheet:
   - Mid_MC_Raw                 (Mid-Module Contest, raw per-user scores)
   - Cheating                   (Module Contest cheating/red-flag detection)
   - Cheating-Mid-Module        (Mid-Module cheating/red-flag detection)
-
 Key differences from the Colab notebook:
   - Auth: METABASE_API_KEY + GOOGLE_SERVICE_ACCOUNT_JSON come from GitHub
     Actions secrets (env vars) instead of `google.colab.userdata` /
@@ -35,14 +33,13 @@ Key differences from the Colab notebook:
   - Fixed a stray syntax bug from the notebook (`worksheet.clear() 1`).
   - Any uncaught exception exits non-zero so the GitHub Actions run goes red.
 """
-
 import os
 import sys
 import re
 import json
 import time
 import traceback
-
+import concurrent.futures as cf
 import requests
 import pandas as pd
 import numpy as np
@@ -80,6 +77,23 @@ gc = gspread.authorize(creds)
 METABASE_BASE = "https://metabase-lierhfgoeiwhr.newtonschool.co"
 SHEET_KEY = "14asHS-hP-dS5-gOggfnFTlbRi9OE23s_-dmcs3dFLRA"
 
+# How many cards to fetch from Metabase at once during the concurrent
+# prefetch phase (see prefetch_all_cards() below). Defined here, ahead of
+# the session pool sizing right below, so the pool is sized to match.
+#
+# These cards routinely take 4-5+ minutes EACH — fetched sequentially (the
+# original design), 11 of them can take 45+ minutes of pure wait time before
+# any Sheets write happens. Fetching them concurrently means total
+# wall-clock time is roughly the slowest card in the busiest batch, not the
+# sum of every card's time. Kept deliberately modest rather than "fetch all
+# 11 at once": card 9656 is already known to hard-reset under backend load
+# from heavy concurrent queries, so cranking concurrency all the way up
+# risks trading fetch time for more connection-reset retries. 3 is a
+# reasonable starting point — tune it based on what you actually see in the
+# run logs (elapsed times, and whether 🔌 connection-error retries get more
+# frequent at higher values).
+PREFETCH_CONCURRENCY = 3
+
 # ═══════════════════════════════════════════════════════════════════════════
 # RETRY-HARDENED SESSION (transport-level: 429/5xx/connection resets)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -96,7 +110,7 @@ _adapter = HTTPAdapter(
         respect_retry_after_header=True,
     ),
     pool_connections=10,
-    pool_maxsize=10,
+    pool_maxsize=max(10, PREFETCH_CONCURRENCY * 2),
 )
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
@@ -160,7 +174,6 @@ def metabase_request(card_id, label=None, timeout=480, max_conn_retries=5,
     label = label or f"card {card_id}"
     url = f'{METABASE_BASE}/api/card/{card_id}/query/json'
     backoff = conn_backoff
-
     for conn_attempt in range(1, max_conn_retries + 1):
         time.sleep(3)  # brief courtesy pause between calls
         suffix = f" (connection retry {conn_attempt}/{max_conn_retries})" if conn_attempt > 1 else ""
@@ -194,7 +207,6 @@ def metabase_request(card_id, label=None, timeout=480, max_conn_retries=5,
             continue
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"❌ Request failed fetching {label} (URL: {url}): {e}")
-
         elapsed = time.time() - start
         if res.status_code != 200:
             raise RuntimeError(
@@ -233,7 +245,6 @@ def fetch_card(card_id, label=None, optional=False, **kwargs):
     if card_id in _card_cache:
         print(f"↺ Reusing cached {label} (already fetched this run)")
         return _card_cache[card_id]
-
     try:
         res = metabase_request(card_id, label, **kwargs)
         data = metabase_json(res, label)
@@ -242,9 +253,77 @@ def fetch_card(card_id, label=None, optional=False, **kwargs):
             print(f"⚠️  {label} failed and is being SKIPPED: {e}")
             return None
         raise
-
     _card_cache[card_id] = data
     return data
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONCURRENT PREFETCH
+# ═══════════════════════════════════════════════════════════════════════════
+# All 11 unique cards this pipeline ever fetches. Every fetch_card() call in
+# the sections below only ever hits one of these 11 IDs (some cards are used
+# by 2-4 sections, which is exactly what the cache is for) — so fetching all
+# 11 up front, concurrently, means the sections below never wait on Metabase
+# at all; they just transform data that's already sitting in _card_cache.
+#
+# Split into required vs. optional to match the failure behavior the script
+# already had: a failure on a required card should still abort the run
+# (RuntimeError, non-zero exit); a failure on a lecture-source card should
+# still degrade gracefully, same as the per-section `optional=True` loop.
+REQUIRED_CARD_SPECS = [
+    (8057, 'card 8057'),
+    (6391, 'card 6391'),
+    (6289, 'card 6289'),
+    (6397, 'card 6397'),
+    (2537, 'card 2537'),
+    (6364, 'card 6364'),
+    (6439, 'card 6439'),
+    (6330, 'card 6330'),
+]
+LECTURE_SOURCE_SPECS = [(6396, 'card 6396'), (9717, 'card 9717'), (9656, 'card 9656')]
+
+# PREFETCH_CONCURRENCY is defined earlier, alongside METABASE_BASE/SHEET_KEY,
+# so the session's connection pool can be sized to match it.
+
+
+def prefetch_all_cards():
+    """Fetch every card this pipeline needs, concurrently, before any
+    section logic runs. After this returns, every fetch_card() call below is
+    a free cache hit ('↺ Reusing cached ...') — no code in the sections
+    needs to change, they already go through the same cache.
+    """
+    total = len(REQUIRED_CARD_SPECS) + len(LECTURE_SOURCE_SPECS)
+    print("\n" + "=" * 60)
+    print(f"PREFETCHING {total} CARDS (concurrency={PREFETCH_CONCURRENCY})")
+    print("=" * 60)
+    t0 = time.time()
+
+    with cf.ThreadPoolExecutor(max_workers=PREFETCH_CONCURRENCY) as pool:
+        required_futures = {
+            pool.submit(fetch_card, cid, lbl): lbl for cid, lbl in REQUIRED_CARD_SPECS
+        }
+        optional_futures = {
+            pool.submit(fetch_card, cid, lbl, optional=True): lbl
+            for cid, lbl in LECTURE_SOURCE_SPECS
+        }
+
+        errors = []
+        for fut in cf.as_completed(required_futures):
+            lbl = required_futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                errors.append(f"{lbl}: {e}")
+
+        for fut in cf.as_completed(optional_futures):
+            fut.result()  # optional=True already converts failures to None + a warning, never raises
+
+        if errors:
+            raise RuntimeError(
+                "❌ Required card fetch(es) failed during prefetch:\n  " + "\n  ".join(errors)
+            )
+
+    print(f"✅ Prefetch done in {time.time() - t0:.0f}s — {len(_card_cache)} cards cached")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -340,17 +419,16 @@ print(f"   SA client_email    : {service_info.get('client_email')}")
 try:
     sheet = safe_open_by_key(SHEET_KEY)
 
+    prefetch_all_cards()
+
     # ── MODULE CONTEST ──────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("MODULE CONTEST")
     print("=" * 60)
-
     df1_2 = pd.DataFrame(fetch_card(8057, 'card 8057'))
     df1 = df1_2
-
     df2 = pd.DataFrame(fetch_card(6391, 'card 6391'))
     df2 = df2.rename(columns={'contest_title': 'contest_name'})
-
     au_raw = fetch_card(6289, 'card 6289')  # cached & reused by every section below
 
     df5 = pd.merge(df2, df1, on=['user_id', 'student_name', 'admin_unit_name',
@@ -366,7 +444,6 @@ try:
     df4 = df3.groupby(['user_id', 'student_name', 'admin_unit_name', 'module_name']).agg({
         'MCQ_score': 'first', 'Coding_score': 'first', 'Total Score': 'max'
     }).reset_index()
-
     df_mc = df4.rename(columns={'Total Score': 'net_module_marks', 'admin_unit_name': 'au_batch_name'})
     df_mc = df_mc[['user_id', 'student_name', 'au_batch_name', 'module_name',
                     'net_module_marks', 'MCQ_score', 'Coding_score']]
@@ -375,13 +452,11 @@ try:
     df_au = pd.DataFrame(au_raw)
     df_au = df_au[['user_id', 'label', 'au_batch_name', 'gem_label']]
     df_au = df_au[df_au['label'].isin(['Enrolled', 'DS Advantage', 'Advantage +'])]
-
     screened_df = pd.merge(df_au, df_mc, on=['user_id', 'au_batch_name'], how='left')
     df_au = df_au.rename(columns={'au_batch_name': 'admin_unit_name'})
     screened_df = screened_df.rename(columns={'au_batch_name': 'admin_unit_name'})
     df_au = df_au.groupby(['admin_unit_name', 'label', 'gem_label'], dropna=False)['user_id'] \
         .nunique().reset_index().rename(columns={'user_id': 'Batch_strength'})
-
     merge_cols = ['admin_unit_name', 'label', 'gem_label']
     df_au[merge_cols] = df_au[merge_cols].fillna('NA')
     screened_df[merge_cols] = screened_df[merge_cols].fillna('NA')
@@ -402,7 +477,6 @@ try:
     print("\n" + "=" * 60)
     print("MID MODULE CLEARANCE")
     print("=" * 60)
-
     # Three lecture-data sources combined. Degrade gracefully if one is
     # chronically flaky (e.g. card 9656's hard connection resets) rather
     # than losing the whole section.
@@ -441,7 +515,6 @@ try:
     df4 = df3.groupby(['user_id', 'student_name', 'admin_unit_name', 'module_name']).agg({
         'MCQ_score': 'first', 'Coding_score': 'first', 'Total Score': 'max'
     }).reset_index()
-
     df_mid = df4.rename(columns={'Total Score': 'net_module_marks', 'admin_unit_name': 'au_batch_name'})
     df_mid = df_mid[['user_id', 'student_name', 'au_batch_name', 'module_name',
                       'net_module_marks', 'MCQ_score', 'Coding_score']]
@@ -450,13 +523,11 @@ try:
     df_au = pd.DataFrame(au_raw)  # reused from cache — no re-fetch
     df_au = df_au[['user_id', 'label', 'au_batch_name', 'gem_label']]
     df_au = df_au[df_au['label'].isin(['Enrolled', 'DS Advantage', 'Advantage +'])]
-
     screened_df = pd.merge(df_au, df_mid, on=['user_id', 'au_batch_name'], how='left')
     df_au = df_au.rename(columns={'au_batch_name': 'admin_unit_name'})
     screened_df = screened_df.rename(columns={'au_batch_name': 'admin_unit_name'})
     df_au = df_au.groupby(['admin_unit_name', 'label', 'gem_label'], dropna=False)['user_id'] \
         .nunique().reset_index().rename(columns={'user_id': 'Batch_strength'})
-
     merge_cols = ['admin_unit_name', 'label', 'gem_label']
     df_au[merge_cols] = df_au[merge_cols].fillna('NA')
     screened_df[merge_cols] = screened_df[merge_cols].fillna('NA')
@@ -477,10 +548,8 @@ try:
     print("\n" + "=" * 60)
     print("CHEATING MODULE CONTEST")
     print("=" * 60)
-
     df1_2 = pd.DataFrame(fetch_card(8057, 'card 8057'))  # cached — no re-fetch
     df_41 = df1_2
-
     df2 = pd.DataFrame(fetch_card(6391, 'card 6391'))  # cached — no re-fetch
     df2 = df2.rename(columns={'contest_title': 'contest_name'})
 
@@ -524,8 +593,8 @@ try:
     df_au = pd.DataFrame(au_raw)  # cached — no re-fetch
     df_au = df_au[['user_id', 'label', 'au_batch_name', 'gem_label']]
     df_au = df_au[df_au['label'].isin(['Enrolled', 'DS Advantage', 'Advantage +'])]
-
     df = pd.merge(df_au, df, on=['user_id', 'au_batch_name'], how='left')
+
     batch_strength = df_au.groupby(['au_batch_name', 'label', 'gem_label'], dropna=False)['user_id'] \
         .nunique().reset_index().rename(columns={'user_id': 'Batch_strength'})
     merge_cols = ['au_batch_name', 'label', 'gem_label']
@@ -555,7 +624,6 @@ try:
     print("\n" + "=" * 60)
     print("CHEATING MID-MODULE CONTEST")
     print("=" * 60)
-
     frames = []
     failed_labels = []
     for cid, lbl in lecture_sources:  # same three cards as Mid Module Clearance — all cached
@@ -617,8 +685,8 @@ try:
     df_au = pd.DataFrame(au_raw)  # cached — no re-fetch
     df_au = df_au[['user_id', 'label', 'au_batch_name', 'gem_label']]
     df_au = df_au[df_au['label'].isin(['Enrolled', 'DS Advantage', 'Advantage +'])]
-
     df = pd.merge(df_au, df, on=['user_id', 'au_batch_name'], how='left')
+
     batch_strength = df_au.groupby(['au_batch_name', 'label', 'gem_label'], dropna=False)['user_id'] \
         .nunique().reset_index().rename(columns={'user_id': 'Batch_strength'})
     merge_cols = ['au_batch_name', 'label', 'gem_label']
