@@ -377,6 +377,8 @@ MONTH_REPLACEMENTS = {
     'Professional Certificate Course In Data Science June 2026': '2026 42 June',
     'Professional Certificate Course In Data Science July 2026': '2026 43 July',
     'Professional Certificate Course In Data Science August 2026': '2026 44 August',
+    'Professional Certificate Course In Data Science September 2026': '2026 45 September',
+
     'Newton Advantage - Data Analytics 2025': 'Advantage Aug 2025',
 }
 _MONTH_PATTERN = '|'.join(re.escape(k) for k in MONTH_REPLACEMENTS.keys())
