@@ -411,89 +411,6 @@ def calculate_total_score(row, has_09):
         return 0
 
 
-
-# ── ROBUST SCORE AGGREGATION ─────────────────────────────────────────────
-def _normalize_keys(frame):
-    frame = frame.copy()
-    for col in ('admin_unit_name', 'au_batch_name', 'module_name'):
-        if col in frame:
-            frame[col] = frame[col].astype('string').str.strip()
-    if 'user_id' in frame:
-        frame['user_id'] = pd.to_numeric(frame['user_id'], errors='coerce').astype('Int64')
-    return frame
-
-
-def build_module_scores(mcq_source, coding_source, label):
-    """Aggregate each score source independently, then join by student/batch/module.
-
-    Avoid joining on contest_date or student_name: one module may have multiple
-    coding contests and a separate MCQ contest. A missing score is not a zero.
-    Best available non-null score per component is retained. This is a
-    best-score policy; adjust if the business requires latest-attempt scoring.
-    """
-    keys = ['user_id', 'admin_unit_name', 'module_name']
-    sources = []
-    for raw, score_col, output_col in (
-        (mcq_source, 'module_wise_score', 'MCQ_score'),
-        (coding_source, 'per_module_marks', 'Coding_score'),
-    ):
-        frame = _normalize_keys(raw)
-        missing = [col for col in keys + [score_col] if col not in frame.columns]
-        if missing:
-            raise ValueError(f'{label}: missing {missing} from {output_col} source')
-        frame[output_col] = pd.to_numeric(frame[score_col], errors='coerce')
-        # Keep real 0 scores, but don't let NULL scores from scheduled contests win.
-        frame = frame.dropna(subset=keys)
-        grouped = frame.groupby(keys, dropna=False)[output_col].max().reset_index()
-        print(f'{label} {output_col}: {len(frame)} source rows, '
-              f'{grouped[output_col].notna().sum()} scored student/modules')
-        sources.append(grouped)
-
-    scores = pd.merge(sources[0], sources[1], on=keys, how='outer')
-    names = pd.concat([_normalize_keys(mcq_source), _normalize_keys(coding_source)], ignore_index=True)
-    if 'student_name' in names.columns:
-        names = names.dropna(subset=['user_id', 'student_name'])
-        names = names.drop_duplicates(subset=['user_id'])[['user_id', 'student_name']]
-        scores = scores.merge(names, on='user_id', how='left')
-    else:
-        scores['student_name'] = ''
-    scores['Total Score'] = scores.apply(
-        lambda row: calculate_total_score(row, has_09=True), axis=1)
-    # No scored component => no attempt, not an artificial zero score.
-    has_score = scores[['MCQ_score', 'Coding_score']].notna().any(axis=1)
-    scores['net_module_marks'] = scores['Total Score'].where(has_score)
-    scores = scores.rename(columns={'admin_unit_name': 'au_batch_name'})
-    print(f'{label}: {len(scores)} student/module rows, '
-          f'{scores.net_module_marks.notna().sum()} with marks')
-    return scores[['user_id', 'student_name', 'au_batch_name', 'module_name',
-                   'net_module_marks', 'MCQ_score', 'Coding_score']]
-
-
-def attach_scores_to_roster(au_raw, module_scores, label):
-    roster = _normalize_keys(pd.DataFrame(au_raw))
-    roster = roster[['user_id', 'label', 'au_batch_name', 'gem_label']]
-    roster = roster[roster['label'].isin(['Enrolled', 'DS Advantage', 'Advantage +'])].copy()
-    scores = _normalize_keys(module_scores)
-    # Normalize both sides to the SAME batch-name format before joining.
-    roster['au_batch_name'] = normalize_batch_names(roster['au_batch_name'])
-    scores['au_batch_name'] = normalize_batch_names(scores['au_batch_name'])
-    # Keep student_name from the contest source for the reporting sheet.
-    roster['gem_label'] = roster['gem_label'].fillna('NA')
-    strength = (roster.groupby(['au_batch_name', 'label', 'gem_label'], dropna=False)
-                ['user_id'].nunique().reset_index(name='Batch_strength'))
-    merged = roster.merge(scores, on=['user_id', 'au_batch_name'], how='left', indicator=True)
-    print(f'{label}: roster={len(roster)}, matched score rows='
-          f'{(merged._merge == "both").sum()}, scored rows='
-          f'{merged.net_module_marks.notna().sum()}')
-    print(f'{label}: Python March 2026 scored rows:', len(merged[
-        merged['au_batch_name'].astype(str).str.contains('2026 39 March', na=False)
-        & merged['module_name'].eq('DS 05 Python')
-        & merged['net_module_marks'].notna()
-    ]))
-    merged = merged.drop(columns=['_merge'])
-    merged = strength.merge(merged, on=['au_batch_name', 'label', 'gem_label'], how='inner')
-    return merged.rename(columns={'au_batch_name': 'admin_unit_name'})
-
 print("🔎 ENV CHECK")
 print(f"   Metabase API key   : {'[SET]' if METABASE_API_KEY else '[MISSING]'}")
 print(f"   SA client_email    : {service_info.get('client_email')}")
@@ -516,13 +433,37 @@ try:
     df2 = df2.rename(columns={'contest_title': 'contest_name'})
     au_raw = fetch_card(6289, 'card 6289')  # cached & reused by every section below
 
-    # Build component scores independently; contest dates and titles may differ.
-    df_mc = build_module_scores(df2, df1, 'Module Contest')
-    module_clearance = attach_scores_to_roster(au_raw, df_mc, 'Module Contest')
+    df5 = pd.merge(df2, df1, on=['user_id', 'student_name', 'admin_unit_name',
+                                  'contest_date', 'module_name'], how='outer')
+    df5 = df5[['user_id', 'student_name', 'admin_unit_name', 'contest_date', 'module_name',
+               'contest_name_x', 'contest_name_y', 'module_wise_score', 'per_module_marks']]
+    df3 = df5.rename(columns={'module_wise_score': 'MCQ_score', 'per_module_marks': 'Coding_score'})
+    df3['MCQ_score'] = pd.to_numeric(df3['MCQ_score'], errors='coerce').fillna(0)
+    df3['Coding_score'] = pd.to_numeric(df3['Coding_score'], errors='coerce').fillna(0)
+    df3['Total Score'] = df3.apply(lambda r: calculate_total_score(r, has_09=True), axis=1)
+    df3 = df3.sort_values(by='Total Score', ascending=False)
 
-    # Retain a raw diagnostic output with one row per student/module.
-    df3 = df_mc.rename(columns={'net_module_marks': 'Total Score',
-                                'au_batch_name': 'admin_unit_name'}).copy()
+    df4 = df3.groupby(['user_id', 'student_name', 'admin_unit_name', 'module_name']).agg({
+        'MCQ_score': 'first', 'Coding_score': 'first', 'Total Score': 'max'
+    }).reset_index()
+    df_mc = df4.rename(columns={'Total Score': 'net_module_marks', 'admin_unit_name': 'au_batch_name'})
+    df_mc = df_mc[['user_id', 'student_name', 'au_batch_name', 'module_name',
+                    'net_module_marks', 'MCQ_score', 'Coding_score']]
+    df_mc['net_module_marks'] = np.where(df_mc['net_module_marks'] == 0, np.nan, df_mc['net_module_marks'])
+
+    df_au = pd.DataFrame(au_raw)
+    df_au = df_au[['user_id', 'label', 'au_batch_name', 'gem_label']]
+    df_au = df_au[df_au['label'].isin(['Enrolled', 'DS Advantage', 'Advantage +'])]
+    screened_df = pd.merge(df_au, df_mc, on=['user_id', 'au_batch_name'], how='left')
+    df_au = df_au.rename(columns={'au_batch_name': 'admin_unit_name'})
+    screened_df = screened_df.rename(columns={'au_batch_name': 'admin_unit_name'})
+    df_au = df_au.groupby(['admin_unit_name', 'label', 'gem_label'], dropna=False)['user_id'] \
+        .nunique().reset_index().rename(columns={'user_id': 'Batch_strength'})
+    merge_cols = ['admin_unit_name', 'label', 'gem_label']
+    df_au[merge_cols] = df_au[merge_cols].fillna('NA')
+    screened_df[merge_cols] = screened_df[merge_cols].fillna('NA')
+    module_clearance = pd.merge(df_au, screened_df, on=merge_cols, how='inner')
+    module_clearance['admin_unit_name'] = normalize_batch_names(module_clearance['admin_unit_name'])
 
     worksheet = sheet.worksheet("Module Clearance")
     worksheet.clear()
@@ -563,10 +504,37 @@ try:
     df2 = pd.DataFrame(fetch_card(6397, 'card 6397'))
     df2 = df2.rename(columns={'contest_title': 'contest_name'})
 
-    df_mid = build_module_scores(df2, df1, 'Mid Module Contest')
-    mid_module_clearance = attach_scores_to_roster(au_raw, df_mid, 'Mid Module Contest')
-    df3 = df_mid.rename(columns={'net_module_marks': 'Total Score',
-                                'au_batch_name': 'admin_unit_name'}).copy()
+    df5 = pd.merge(df2, df1, on=['user_id', 'student_name', 'admin_unit_name',
+                                  'contest_date', 'module_name'], how='outer')
+    df5 = df5[['user_id', 'student_name', 'admin_unit_name', 'contest_date', 'module_name',
+               'contest_name_x', 'contest_name_y', 'module_wise_score', 'per_module_marks']]
+    df3 = df5.rename(columns={'module_wise_score': 'MCQ_score', 'per_module_marks': 'Coding_score'})
+    df3['MCQ_score'] = pd.to_numeric(df3['MCQ_score'], errors='coerce').fillna(0)
+    df3['Coding_score'] = pd.to_numeric(df3['Coding_score'], errors='coerce').fillna(0)
+    df3['Total Score'] = df3.apply(lambda r: calculate_total_score(r, has_09=True), axis=1)
+    df3 = df3.sort_values(by='Total Score', ascending=False)
+
+    df4 = df3.groupby(['user_id', 'student_name', 'admin_unit_name', 'module_name']).agg({
+        'MCQ_score': 'first', 'Coding_score': 'first', 'Total Score': 'max'
+    }).reset_index()
+    df_mid = df4.rename(columns={'Total Score': 'net_module_marks', 'admin_unit_name': 'au_batch_name'})
+    df_mid = df_mid[['user_id', 'student_name', 'au_batch_name', 'module_name',
+                      'net_module_marks', 'MCQ_score', 'Coding_score']]
+    df_mid['net_module_marks'] = np.where(df_mid['net_module_marks'] == 0, np.nan, df_mid['net_module_marks'])
+
+    df_au = pd.DataFrame(au_raw)  # reused from cache — no re-fetch
+    df_au = df_au[['user_id', 'label', 'au_batch_name', 'gem_label']]
+    df_au = df_au[df_au['label'].isin(['Enrolled', 'DS Advantage', 'Advantage +'])]
+    screened_df = pd.merge(df_au, df_mid, on=['user_id', 'au_batch_name'], how='left')
+    df_au = df_au.rename(columns={'au_batch_name': 'admin_unit_name'})
+    screened_df = screened_df.rename(columns={'au_batch_name': 'admin_unit_name'})
+    df_au = df_au.groupby(['admin_unit_name', 'label', 'gem_label'], dropna=False)['user_id'] \
+        .nunique().reset_index().rename(columns={'user_id': 'Batch_strength'})
+    merge_cols = ['admin_unit_name', 'label', 'gem_label']
+    df_au[merge_cols] = df_au[merge_cols].fillna('NA')
+    screened_df[merge_cols] = screened_df[merge_cols].fillna('NA')
+    mid_module_clearance = pd.merge(df_au, screened_df, on=merge_cols, how='inner')
+    mid_module_clearance['admin_unit_name'] = normalize_batch_names(mid_module_clearance['admin_unit_name'])
 
     worksheet = sheet.worksheet("Mid Module Clearance")
     worksheet.clear()
